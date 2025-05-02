@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cs336_systems.rms import RMSNormTriton
 
 from .nn_utils import softmax
 
@@ -94,6 +95,8 @@ class BasicsTransformerLM(nn.Module):
         d_ff: int,
         attn_pdrop: Optional[float] = None,
         residual_pdrop: Optional[float] = None,
+        use_layernorm: bool = False,
+        use_triton_rmsnorm: bool = False,
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
@@ -114,6 +117,8 @@ class BasicsTransformerLM(nn.Module):
                     d_ff=d_ff,
                     attn_pdrop=attn_pdrop,
                     residual_pdrop=residual_pdrop,
+                    use_layernorm=use_layernorm,
+                    use_triton_rmsnorm=use_triton_rmsnorm,
                 )
                 for _ in range(num_layers)
             ]
@@ -287,17 +292,29 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         attn_pdrop: Optional[float] = None,
         residual_pdrop: Optional[float] = None,
+        use_layernorm: bool = False,
+        use_triton_rmsnorm: bool = False,
     ):
         super().__init__()
+        assert not (use_layernorm and use_triton_rmsnorm), "Can't use both LayerNorm and RMSNorm"
         self.attn = CausalMultiHeadSelfAttention(
             d_model=d_model,
             num_heads=num_heads,
             attn_pdrop=attn_pdrop,
         )
-        self.ln1 = RMSNorm(d_model)
+        if use_triton_rmsnorm:
+            self.ln1_w = nn.Parameter(torch.ones(d_model))
+            self.ln2_w = nn.Parameter(torch.ones(d_model))
+        elif use_layernorm:
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
+        else:
+            self.ln1 = RMSNorm(d_model)
+            self.ln2 = RMSNorm(d_model)
         self.ffn = FFN(d_model=d_model, d_ff=d_ff)
-        self.ln2 = RMSNorm(d_model)
         self.residual_pdrop = residual_pdrop
+        self.use_layernorm = use_layernorm
+        self.use_triton_rmsnorm = use_triton_rmsnorm
 
     def forward(self, x: torch.Tensor):
         """
@@ -311,13 +328,19 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
+        if not self.use_triton_rmsnorm:
+            x_attn = self.attn(self.ln1(x))
+        else:
+            x_attn = RMSNormTriton.apply(self.attn(x), self.ln1_w)
         if self.residual_pdrop is not None:
             x_attn = F.dropout(x_attn, self.residual_pdrop)
         attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+        if not self.use_triton_rmsnorm:
+            x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+        else:
+            x_ffn = RMSNormTriton.apply(self.ffn(attn_sublayer_output), self.ln2_w)
         if self.residual_pdrop is not None:
             x_ffn = F.dropout(x_ffn, self.residual_pdrop)
         ffn_sublayer_output = attn_sublayer_output + x_ffn
@@ -336,6 +359,8 @@ class FFN(nn.Module):
         x = self.w2(x)
         return x
 
+a = FFN(10, 20)
+a.w1.weight.grad
 
 def scaled_dot_product_attention(
     K: torch.FloatTensor,

@@ -126,4 +126,4 @@ def main(run_backward: bool = False):
 
 
 if __name__ == "__main__":
-    main(run_backward=True)
+    main(run_backward=False)

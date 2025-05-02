@@ -16,7 +16,9 @@ def get_rmsnorm_autograd_function_pytorch() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyRMSNormAutogradFunctionClass
-    raise NotImplementedError
+    from cs336_systems.rms import RMSNorm
+
+    return RMSNorm
 
 
 def get_rmsnorm_autograd_function_triton() -> Type:
@@ -32,7 +34,9 @@ def get_rmsnorm_autograd_function_triton() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyTritonRMSNormAutogradFunctionClass
-    raise NotImplementedError
+    from cs336_systems.rms import RMSNormTriton
+
+    return RMSNormTriton
 
 
 def rmsnorm_backward_g_pytorch(
@@ -53,7 +57,9 @@ def rmsnorm_backward_g_pytorch(
     Returns:
         Gradient of the loss with respect to g. Shape: (H,)
     """
-    raise NotImplementedError
+    from cs336_systems.rms import rmsnorm_grad_weight
+
+    return rmsnorm_grad_weight(x, g, grad_output, 1e-5)
 
 
 def rmsnorm_backward_x_pytorch(
@@ -74,7 +80,9 @@ def rmsnorm_backward_x_pytorch(
     Returns:
         Gradient of the loss with respect to x. Shape: (*, H)
     """
-    raise NotImplementedError
+    from cs336_systems.rms import rmsnorm_grad_x
+
+    return rmsnorm_grad_x(x, g, grad_output, 1e-5)
 
 
 def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
@@ -95,7 +103,8 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDPIndividualParameters(module)
-    raise NotImplementedError
+    from cs336_systems.ddp_overlap import DDP
+    return DDP(module)
 
 
 def ddp_individual_parameters_on_after_backward(
@@ -112,7 +121,7 @@ def ddp_individual_parameters_on_after_backward(
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn.Module:
@@ -133,7 +142,9 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    raise NotImplementedError
+    from cs336_systems.ddp_bucket import DDPBucketed
+    #return DDPBucketed(module, bucket_size_mb)
+    return DDPBucketed(module, bucket_size_mb)
 
 
 def ddp_bucketed_on_after_backward(
@@ -150,7 +161,7 @@ def ddp_bucketed_on_after_backward(
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def ddp_bucketed_on_train_batch_start(
@@ -165,7 +176,7 @@ def ddp_bucketed_on_train_batch_start(
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    raise NotImplementedError
+    pass
 
 
 def get_sharded_optimizer(
@@ -186,4 +197,5 @@ def get_sharded_optimizer(
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    from cs336_systems.optimizer_sharding import OptimizerSharded
+    return OptimizerSharded(params, optimizer_cls, **kwargs)

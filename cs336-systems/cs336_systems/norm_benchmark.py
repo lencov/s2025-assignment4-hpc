@@ -1,4 +1,4 @@
-from cs336_basics.model import RMSNorm
+from cs336_basics.transformer import RMSNorm
 from cs336_systems.rms import RMSNormTriton
 import torch
 import time

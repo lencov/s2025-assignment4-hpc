@@ -8,8 +8,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from cs336_basics.optimizer import AdamW
-from cs336_basics.nn_utils import cross_entropy
-from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.loss import cross_entropy
+from cs336_basics.transformer import TransformerLM
 from torch.profiler import profile, record_function, ProfilerActivity
 
 
@@ -89,7 +89,7 @@ MODEL_CONFIGS = {
 
 
 def run_step(
-    model: BasicsTransformerLM,
+    model: TransformerLM,
     inputs: torch.Tensor,
     optimizer: AdamW,
     enable_backward: bool,
@@ -133,7 +133,7 @@ def main(
     assert not (
         not do_profile and profile_memory
     ), "Cannot profile memory without profiling"
-    model = BasicsTransformerLM(
+    model = TransformerLM(
         vocab_size=model_args.vocab_size,
         context_length=model_args.context_length,
         d_model=model_args.d_model,
@@ -142,8 +142,7 @@ def main(
         d_ff=model_args.d_ff,
         attn_pdrop=model_args.attn_pdrop,
         residual_pdrop=model_args.residual_pdrop,
-        use_layernorm=model_args.use_layer_norm,
-        use_triton_rmsnorm=model_args.use_triton_rmsnorm,
+        norm_type="pre" if model_args.use_layer_norm else "none",
     ).to(DEVICE)
     if trainer_args.compile:
         model = torch.compile(model)

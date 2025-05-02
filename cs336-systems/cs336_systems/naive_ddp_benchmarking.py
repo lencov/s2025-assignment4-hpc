@@ -11,8 +11,8 @@ from dataclasses import dataclass
 import torch.multiprocessing as mp
 from copy import deepcopy
 from cs336_basics.optimizer import AdamW
-from cs336_basics.nn_utils import cross_entropy
-from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.loss import cross_entropy
+from cs336_basics.transformer import TransformerLM
 from cs336_systems.optimizer_sharding import OptimizerSharded
 import timeit
 from cs336_systems.ddp_bucket import DDPBucketed
@@ -170,7 +170,7 @@ def ddp_main(
     data = data.to(DEVICE)
     labels = labels.to(DEVICE)
 
-    model = BasicsTransformerLM(
+    model = TransformerLM(
         vocab_size=model_args.vocab_size,
         context_length=model_args.context_length,
         d_model=model_args.d_model,
@@ -179,8 +179,7 @@ def ddp_main(
         d_ff=model_args.d_ff,
         attn_pdrop=model_args.attn_pdrop,
         residual_pdrop=model_args.residual_pdrop,
-        use_layernorm=model_args.use_layer_norm,
-        use_triton_rmsnorm=model_args.use_triton_rmsnorm,
+        norm_type="pre" if model_args.use_layer_norm else "none",
     ).to(DEVICE)
 
     if shard_optim:

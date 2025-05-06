@@ -133,6 +133,7 @@ def main(
     assert not (
         not do_profile and profile_memory
     ), "Cannot profile memory without profiling"
+
     model = TransformerLM(
         vocab_size=model_args.vocab_size,
         context_length=model_args.context_length,
@@ -142,8 +143,10 @@ def main(
         d_ff=model_args.d_ff,
         attn_pdrop=model_args.attn_pdrop,
         residual_pdrop=model_args.residual_pdrop,
-        norm_type="pre" if model_args.use_layer_norm else "none",
+        use_layer_norm=model_args.use_layer_norm, # Make sure your TransformerLM uses these
+        use_triton_rmsnorm=model_args.use_triton_rmsnorm,
     ).to(DEVICE)
+
     if trainer_args.compile:
         model = torch.compile(model)
     optimizer = AdamW(
@@ -162,43 +165,37 @@ def main(
         run_step(
             model,
             dummy_data,
-            AdamW(model.parameters()),
+            AdamW(model.parameters()), # Use separate optimizer for warmup state
             trainer_args.run_backward,
             mixed_precision=trainer_args.mixed_precision,
             profile=False,
         )
     torch.cuda.synchronize()
 
-    if profile_memory:
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
-
-    with (
-        profile(
+    profiler_context = profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=(
+            # Use schedule=None when profiling memory
+            schedule=None if profile_memory else (
                 torch.profiler.schedule(
-                    wait=0, warmup=0, active=1, repeat=trainer_args.train_steps
+                    wait=0, warmup=0, active=trainer_args.train_steps, repeat=1
                 )
-                if profile_memory
-                else None
             ),
             experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
             record_shapes=True,
             profile_memory=profile_memory,
             with_stack=True,
-        )
-        if do_profile
-        else nullcontext()
-    ) as prof:
+        ) if do_profile else nullcontext()
+
+    logger.info("Starting profiling loop...")
+    with profiler_context as prof:
         forward_times = []
         backward_times = []
         optimizer_times = []
-        for _ in tqdm(range(trainer_args.train_steps)):
-            if do_profile:
-                prof.step()
+        for i in tqdm(range(trainer_args.train_steps)):
+            # prof.step() is not called when schedule is None
             f, b, o = run_step(
                 model,
                 dummy_data,
@@ -210,34 +207,56 @@ def main(
             forward_times.append(f)
             backward_times.append(b)
             optimizer_times.append(o)
-        torch.cuda.synchronize()
+
+    torch.cuda.synchronize()
+    logger.info("Profiling loop finished.")
+
+    if do_profile and prof:
+        logger.info("Exporting profiler results...")
+        try:
+             prof.export_stacks("lm_profiler_stacks.txt", "self_cuda_time_total")
+             logger.info("Exported profiler stacks.")
+             print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+        except Exception as e:
+             logger.error(f"Failed to export/print stacks/table: {e}")
+
         if profile_memory:
-            prof.export_memory_timeline(
-                f"timeline-{model_args.name}-run-backward-{trainer_args.run_backward}.html",
-                device=DEVICE,
-            )
-    print(f"Forward time: {np.mean(forward_times):.4f} s")
-    print(f"Backward time: {np.mean(backward_times):.4f} s")
-    print(f"Optimizer time: {np.mean(optimizer_times):.4f} s")
+            try:
+                logger.info("Attempting to export memory timeline HTML...")
+                prof.export_memory_timeline(
+                    f"timeline-{model_args.name}-run-backward-{trainer_args.run_backward}.html",
+                    device=DEVICE,
+                )
+                logger.info("Exported memory timeline HTML successfully.")
+            except ValueError as e:
+                 logger.error(f"Failed to export memory timeline HTML: {e}. Likely no memory events recorded by timeline mechanism.")
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during HTML export: {e}")
 
-    if do_profile:
-        prof.export_stacks("lm_profiler_stacks.txt", "self_cuda_time_total")
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+    if profile_memory: # Keep the pickle dump separate
+        try:
+             logger.info("Attempting to dump memory snapshot pickle...")
+             if "cuda" in DEVICE:
+                 torch.cuda.synchronize(device=DEVICE)
+             torch.cuda.memory._dump_snapshot(
+                 f"memory_snapshot-{model_args.name}-run-backward-{trainer_args.run_backward}.pickle"
+             )
+             logger.info("Dumped memory snapshot pickle successfully.")
+        except Exception as e:
+            logger.error(f"Failed to dump memory snapshot pickle: {e}")
 
-    if profile_memory:
-        torch.cuda.memory._dump_snapshot(
-            f"memory_snapshot-{model_args.name}-run-backward-{trainer_args.run_backward}.pickle"
-        )
-        torch.cuda.memory._record_memory_history(enabled=None)
+    print(f"Forward time: {np.mean(forward_times):.4f} s (std: {np.std(forward_times):.4f} s)")
+    print(f"Backward time: {np.mean(backward_times):.4f} s (std: {np.std(backward_times):.4f} s)")
+    print(f"Optimizer time: {np.mean(optimizer_times):.4f} s (std: {np.std(optimizer_times):.4f} s)")
 
-
+# Keep the if __name__ == "__main__": block as it was
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-config",
         type=str,
         default="small",
-        choices=MODEL_CONFIGS.keys(),
+        choices=list(MODEL_CONFIGS.keys()),
     )
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--train-steps", type=int, default=5)

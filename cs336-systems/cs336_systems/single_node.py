@@ -24,8 +24,15 @@ TENSOR_SIZES: Dict[str, int] = {
 
 
 def setup(rank: int, world_size: int, backend: str, use_cuda: bool) -> None:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    master_addr = os.environ.get("MASTER_ADDR", "localhost")
+    master_port = os.environ.get("MASTER_PORT", "12355") # Default if not set by Slurm
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = master_port
+    
+    if rank == 0:
+        logger.debug(f"Rank {rank}: Initializing process group. Master: {master_addr}:{master_port}, World: {world_size}, Backend: {backend}")
+        
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     if backend == "nccl" or (backend == "gloo" and use_cuda):
         torch.cuda.set_device(rank)

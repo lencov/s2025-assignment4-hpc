@@ -25,17 +25,30 @@ TENSOR_SIZES: Dict[str, int] = {
 
 def setup(rank: int, world_size: int, backend: str, use_cuda: bool) -> None:
     master_addr = os.environ.get("MASTER_ADDR", "localhost")
-    master_port = os.environ.get("MASTER_PORT", "12355") # Default if not set by Slurm
+    master_port = os.environ.get("MASTER_PORT", "12355") 
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port
-    
+
     if rank == 0:
         logger.debug(f"Rank {rank}: Initializing process group. Master: {master_addr}:{master_port}, World: {world_size}, Backend: {backend}")
-        
+
     dist.init_process_group(backend, rank=rank, world_size=world_size)
+
     if backend == "nccl" or (backend == "gloo" and use_cuda):
-        torch.cuda.set_device(rank)
+        target_device = rank # Default mapping
+        if backend == "nccl":
+            num_physical_gpus_available = 2 # Based on your nvidia-smi for A30s
+            num_mig_per_physical = 2    # Based on your nvidia-smi
+
+            # If world_size is small enough that we can pick MIGs from different physical GPUs
+            if world_size <= num_physical_gpus_available:
+                # Map rank 'r' to the first MIG on physical GPU 'r'
+                target_device = rank * num_mig_per_physical 
+
+        if rank == 0: # Log only for rank 0 to avoid clutter
+            logger.debug(f"Rank {rank} (world_size {world_size}, backend {backend}) attempting to use CUDA device {target_device}")
+        torch.cuda.set_device(target_device)
 
 
 def benchmark_all_reduce(

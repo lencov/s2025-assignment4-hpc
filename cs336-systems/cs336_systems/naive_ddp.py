@@ -58,13 +58,39 @@ class ToyModel(nn.Module):
 
 
 def setup_singlenode(
-    backend: str = str, rank: int = None, world_size: int = None
+    backend: str, rank: int, world_size: int # Made args required for clarity
 ) -> None:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    # Use environment variables if set, otherwise default
+    master_addr = os.environ.get("MASTER_ADDR", "localhost")
+    # Using a different default port than single_node.py just in case
+    master_port = os.environ.get("MASTER_PORT", "12356")
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = master_port
+
+    if rank == 0:
+        logger.debug(f"Rank {rank}: Initializing process group. Master: {master_addr}:{master_port}, World: {world_size}, Backend: {backend}")
+
+    # Initialize process group
     dist.init_process_group(backend, rank=rank, world_size=world_size)
+
+    # --- MODIFIED GPU DEVICE SETTING for NCCL+MIG ---
     if backend == "nccl":
-        torch.cuda.set_device(rank)
+        if world_size == 2:
+            target_device = 0 if rank == 0 else 2
+            logger.debug(f"Rank {rank} (NCCL, WS=2, MIG): Mapping to CUDA device {target_device}")
+            torch.cuda.set_device(target_device)
+        elif world_size == 4:
+             # Map ranks 0,1,2,3 to devices 0,1,2,3
+             target_device = rank
+             logger.debug(f"Rank {rank} (NCCL, WS=4, MIG): Mapping to CUDA device {target_device}")
+             torch.cuda.set_device(target_device)
+             # Note: This world_size=4 mapping failed in single_node.py, likely will here too.
+        else:
+             # Fallback for other world sizes (if ever used with this script)
+             logger.debug(f"Rank {rank} (NCCL, WS={world_size}, MIG): Using default mapping to device {rank}")
+             torch.cuda.set_device(rank) # This might fail if ws > available MIGs
+    # --- END MODIFIED GPU DEVICE SETTING --
 
 
 def setup_multinode(backend: str) -> None:

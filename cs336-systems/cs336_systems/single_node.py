@@ -91,7 +91,7 @@ def main() -> None:
     args = parser.parse_args()
 
     backends = ["gloo", "nccl"] if args.backend == "all" else [args.backend]
-    world_sizes = [2, 4, 6] if args.world_size == 0 else [args.world_size]
+    world_sizes = [2, 4] if args.world_size == 0 else [args.world_size]
     tensor_sizes = (
         TENSOR_SIZES.keys() if args.tensor_size == "all" else [args.tensor_size]
     )

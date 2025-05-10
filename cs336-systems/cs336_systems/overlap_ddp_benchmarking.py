@@ -13,10 +13,11 @@ import timeit
 from cs336_basics.transformer import TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.loss import cross_entropy
-from cs336_systems.ddp import DDP # Import your DDP class
+from cs336_systems.ddp import DDP 
 
 from torch.profiler import profile, ProfilerActivity
 from contextlib import nullcontext
+from typing import Optional, Dict # Added Dict
 
 logging.basicConfig(
     format="%(asctime)s (%(levelname)s) [%(funcName)s:%(lineno)d] %(message)s",
@@ -24,19 +25,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODEL_CONFIGS = {
-    "small": {"d_model": 768, "num_layers": 12, "num_heads": 12, "d_ff": 3072, "vocab_size": 10000, "context_length": 128, "attn_pdrop": 0.1, "residual_pdrop": 0.05},
-    "medium": {"d_model": 1024, "num_layers": 24, "num_heads": 16, "d_ff": 4096, "vocab_size": 10000, "context_length": 128, "attn_pdrop": 0.1, "residual_pdrop": 0.05},
-    "large": {"d_model": 1280, "num_layers": 36, "num_heads": 20, "d_ff": 5120, "vocab_size": 10000, "context_length": 128, "attn_pdrop": 0.1, "residual_pdrop": 0.05},
+@dataclass
+class ModelArgs:
+    d_model: int
+    num_layers: int
+    num_heads: int
+    d_ff: int
+    vocab_size: int = 10000
+    context_length: int = 128
+    attn_pdrop: Optional[float] = 0.1
+    residual_pdrop: Optional[float] = 0.05
+    use_layer_norm: Optional[bool] = False 
+    use_triton_rmsnorm: Optional[bool] = False
+    name: str = "small"
+
+MODEL_CONFIGS: Dict[str, ModelArgs] = {
+    "small": ModelArgs(d_model=768, num_layers=12, num_heads=12, d_ff=3072),
+    "medium": ModelArgs(d_model=1024, num_layers=24, num_heads=16, d_ff=4096),
+    "large": ModelArgs(d_model=1280, num_layers=36, num_heads=20, d_ff=5120),
 }
 OPTIMIZER_ARGS = {"lr": 1e-4, "betas": (0.9, 0.99), "eps": 1e-9, "weight_decay": 0.1}
 
-use_cuda_flag_from_args = False # Global for setup_distributed when using mp.spawn
+_global_use_cuda_for_spawn = False 
 
 def setup_distributed(rank: int, world_size: int, backend: str, multinode: bool, use_cuda_for_setup: bool):
     if multinode:
-        if rank == -1:
-             return None, None
+        if rank == -1: 
+             return None, None 
         
         actual_rank = int(os.environ["SLURM_PROCID"])
         actual_world_size = int(os.environ["SLURM_NTASKS"])
@@ -51,21 +66,24 @@ def setup_distributed(rank: int, world_size: int, backend: str, multinode: bool,
             world_size=actual_world_size,
             timeout=timedelta(seconds=120)
         )
-        if backend == "nccl": # NCCL implies CUDA
+        if use_cuda_for_setup and backend == "nccl":
             torch.cuda.set_device(int(os.environ["SLURM_LOCALID"]))
         return actual_rank, actual_world_size
-    else: # Single-node
+    else: 
         os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500") 
         
         logger.info(f"Rank {rank}/{world_size} on {os.uname()[1]}: Initializing process group (single-node). Master: {os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}")
         dist.init_process_group(backend, rank=rank, world_size=world_size)
+        
+        # --- SIMPLIFIED GPU SETTING FOR SINGLE NODE ---
         if use_cuda_for_setup and torch.cuda.is_available():
-            target_device = rank
-            if backend == "nccl" and world_size == 2: # MIG fix
-                target_device = 0 if rank == 0 else 2
-            logger.info(f"Rank {rank} attempting to use CUDA device {target_device}")
-            torch.cuda.set_device(target_device)
+            if rank < torch.cuda.device_count():
+                 torch.cuda.set_device(rank) # Each process (rank) gets its own GPU index
+                 if rank == 0: logger.debug(f"Rank {rank} (backend {backend}) set to CUDA device {rank}")
+            else:
+                 if rank == 0: logger.error(f"Rank {rank} wants device {rank} but only {torch.cuda.device_count()} devices available.")
+        # --- END SIMPLIFIED GPU SETTING ---
         return rank, world_size
 
 def ddp_overlap_benchmark_worker(
@@ -78,8 +96,8 @@ def ddp_overlap_benchmark_worker(
     enable_profiling: bool,
     profile_output_file: str
 ):
-    global use_cuda_flag_from_args
-    use_cuda_flag_from_args = use_cuda_passed
+    global _global_use_cuda_for_spawn
+    _global_use_cuda_for_spawn = use_cuda_passed
 
     actual_rank, actual_world_size = setup_distributed(rank, world_size, backend, multinode, use_cuda_passed)
     if multinode and actual_rank is None:
@@ -88,28 +106,27 @@ def ddp_overlap_benchmark_worker(
     DEVICE = "cuda" if use_cuda_passed and torch.cuda.is_available() else "cpu"
     if actual_rank == 0: logger.info(f"Using device: {DEVICE}, Rank: {actual_rank}, WorldSize: {actual_world_size}")
 
-    cfg = MODEL_CONFIGS[model_config_name]
+    cfg_data = MODEL_CONFIGS[model_config_name]
     model = TransformerLM(
-        vocab_size=cfg["vocab_size"],
-        context_length=cfg["context_length"],
-        d_model=cfg["d_model"],
-        num_layers=cfg["num_layers"],
-        num_heads=cfg["num_heads"],
-        d_ff=cfg["d_ff"],
-        attn_pdrop=cfg.get("attn_pdrop"),
-        residual_pdrop=cfg.get("residual_pdrop"),
-        # Ensure your TransformerLM handles these or has sensible defaults
-        use_layer_norm=False, # Assuming default is RMSNorm from your transformer.py
-        use_triton_rmsnorm=False
+        vocab_size=cfg_data.vocab_size,
+        context_length=cfg_data.context_length,
+        d_model=cfg_data.d_model,
+        num_layers=cfg_data.num_layers,
+        num_heads=cfg_data.num_heads,
+        d_ff=cfg_data.d_ff,
+        attn_pdrop=cfg_data.attn_pdrop,
+        residual_pdrop=cfg_data.residual_pdrop,
+        use_layer_norm=cfg_data.use_layer_norm,
+        use_triton_rmsnorm=cfg_data.use_triton_rmsnorm
     ).to(DEVICE)
 
     ddp_model = DDP(model)
     optimizer = AdamW(ddp_model.parameters(), **OPTIMIZER_ARGS)
 
-    batch_size_per_gpu = 16
+    batch_size_per_gpu = 16 
     local_batch_size = batch_size_per_gpu
-    inputs = torch.randint(0, cfg["vocab_size"], (local_batch_size, cfg["context_length"]), device=DEVICE)
-    targets = torch.randint(0, cfg["vocab_size"], (local_batch_size, cfg["context_length"]), device=DEVICE)
+    inputs = torch.randint(0, cfg_data.vocab_size, (local_batch_size, cfg_data.context_length), device=DEVICE)
+    targets = torch.randint(0, cfg_data.vocab_size, (local_batch_size, cfg_data.context_length), device=DEVICE)
     
     num_warmup_steps = 5
     num_benchmark_steps = 10
@@ -117,7 +134,7 @@ def ddp_overlap_benchmark_worker(
     for step in range(num_warmup_steps):
         optimizer.zero_grad(set_to_none=True)
         logits = ddp_model(inputs)
-        loss = cross_entropy(logits.view(-1, cfg["vocab_size"]), targets.view(-1))
+        loss = cross_entropy(logits.view(-1, cfg_data.vocab_size), targets.view(-1))
         loss.backward()
         ddp_model.finish_gradient_synchronization()
         optimizer.step()
@@ -140,7 +157,7 @@ def ddp_overlap_benchmark_worker(
 
             optimizer.zero_grad(set_to_none=True)
             logits = ddp_model(inputs)
-            loss = cross_entropy(logits.view(-1, cfg["vocab_size"]), targets.view(-1))
+            loss = cross_entropy(logits.view(-1, cfg_data.vocab_size), targets.view(-1))
             loss.backward()
             ddp_model.finish_gradient_synchronization()
             optimizer.step()
@@ -180,7 +197,7 @@ def main():
 
     if args.multinode:
         ddp_overlap_benchmark_worker(
-            -1, -1, # rank, world_size are placeholders, ignored in multinode setup_distributed
+            -1, -1, 
             args.backend, args.use_cuda, args.model_config, True,
             args.enable_profiling, args.profile_output_file
         )

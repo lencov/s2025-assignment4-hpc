@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -6,24 +7,25 @@ import os
 from tqdm import tqdm
 import argparse
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Dict # Added Dict
 from dataclasses import dataclass
 import torch.multiprocessing as mp
 from copy import deepcopy
+import timeit # For timing
+
+# Import from your Assignment 1 code
+from cs336_basics.transformer import TransformerLM # Assuming this is your model class
 from cs336_basics.optimizer import AdamW
-from cs336_basics.loss import cross_entropy
-from cs336_basics.transformer import TransformerLM
-from cs336_systems.optimizer_sharding import OptimizerSharded
-import timeit
-from cs336_systems.ddp_bucket import DDPBucketed
+from cs336_basics.loss import cross_entropy # Assuming this is your loss function
 
-
-# setup logging
-logging.basicConfig(format="%(asctime)s (%(levelname)s): %(message)s")
+# Setup logging
+logging.basicConfig(
+    format="%(asctime)s (%(levelname)s) [%(funcName)s:%(lineno)d] %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-
+# Model configurations (same as your benchmark.py)
 @dataclass
 class ModelArgs:
     d_model: int
@@ -34,337 +36,219 @@ class ModelArgs:
     context_length: int = 128
     attn_pdrop: Optional[float] = 0.1
     residual_pdrop: Optional[float] = 0.05
-    use_layer_norm: Optional[bool] = False
-    use_triton_rmsnorm: Optional[bool] = False
+    use_layer_norm: Optional[bool] = False # For TransformerLM init
+    use_triton_rmsnorm: Optional[bool] = False # For TransformerLM init
     name: str = "small"
 
 
-@dataclass
-class TrainerArgs:
-    batch_size: int = 16
-    warmup_steps: int = 1
-    train_steps: int = 5
-    run_backward: bool = False
-    mixed_precision: bool = False
-    compile: bool = False
-
-
-@dataclass
-class OptimizerArgs:
-    lr: float = 1e-4
-    betas: tuple[float, float] = (0.9, 0.99)
-    eps: float = 1e-9
-    weight_decay: float = 0.1
-
-
-MODEL_CONFIGS = {
-    "small": ModelArgs(
-        d_model=768,
-        num_layers=12,
-        num_heads=12,
-        d_ff=3072,
-    ),
-    "medium": ModelArgs(
-        d_model=1024,
-        num_layers=24,
-        num_heads=16,
-        d_ff=4096,
-    ),
-    "large": ModelArgs(
-        d_model=1280,
-        num_layers=36,
-        num_heads=20,
-        d_ff=5120,
-    ),
-    "xl": ModelArgs(
-        d_model=1600,
-        num_layers=48,
-        num_heads=25,
-        d_ff=6400,
-    ),
-    "2.7B": ModelArgs(
-        d_model=2560,
-        num_layers=32,
-        num_heads=32,
-        d_ff=10240,
-    ),
+MODEL_CONFIGS: Dict[str, ModelArgs] = {
+    "small": ModelArgs(d_model=768, num_layers=12, num_heads=12, d_ff=3072),
+    "medium": ModelArgs(d_model=1024, num_layers=24, num_heads=16, d_ff=4096),
+    "large": ModelArgs(d_model=1280, num_layers=36, num_heads=20, d_ff=5120),
+    # Add other configs if needed, ensure they match what TransformerLM expects
 }
+OPTIMIZER_ARGS = {"lr": 1e-4, "betas": (0.9, 0.99), "eps": 1e-9, "weight_decay": 0.1}
 
+# Global for passing use_cuda to setup_singlenode via mp.spawn
+_global_use_cuda_for_spawn = False
 
-def validate_ddp_net_equivalence(net: nn.Module, rank: int):
-    # Helper to validate synchronization of nets across ranks.
-    net_module_states = list(net.state_dict().values())
-    # Check that all tensors in module's state_dict() are equal.
-    for t in net_module_states:
-        tensor_list = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
-        dist.all_gather(tensor_list, t)
-        for tensor in tensor_list:
-            assert torch.allclose(tensor, t)
-    if rank == 0:
-        logger.info("All parameters are equal across all ranks")
+def setup_distributed(rank: int, world_size: int, backend: str, multinode: bool, use_cuda_for_setup: bool):
+    if multinode:
+        if rank == -1: 
+             return None, None 
+        
+        actual_rank = int(os.environ["SLURM_PROCID"])
+        actual_world_size = int(os.environ["SLURM_NTASKS"])
+        master_addr = os.environ["MASTER_ADDR"]
+        master_port = os.environ["MASTER_PORT"]
+        
+        logger.info(f"Rank {actual_rank}/{actual_world_size} on {os.uname()[1]}: Initializing process group (multinode). Master: {master_addr}:{master_port}")
+        dist.init_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_addr}:{master_port}",
+            rank=actual_rank,
+            world_size=actual_world_size,
+            timeout=timedelta(seconds=120)
+        )
+        if use_cuda_for_setup and backend == "nccl":
+            torch.cuda.set_device(int(os.environ["SLURM_LOCALID"]))
+        return actual_rank, actual_world_size
+    else: # Single-node
+        os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "14322") # Default port for this script
+        
+        logger.info(f"Rank {rank}/{world_size} on {os.uname()[1]}: Initializing process group (single-node). Master: {os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}")
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        if use_cuda_for_setup and torch.cuda.is_available():
+            target_device = rank
+            if backend == "nccl" and world_size == 2: # Your MIG fix
+                target_device = 0 if rank == 0 else 2 
+            elif backend == "nccl" and world_size == 4: # Your MIG fix for 4
+                target_device = rank 
+            
+            if rank < torch.cuda.device_count(): # General check
+                 torch.cuda.set_device(target_device)
+                 if rank == 0: logger.debug(f"Rank {rank} (backend {backend}) set to CUDA device {target_device}")
+            else:
+                 if rank == 0: logger.error(f"Rank {rank} wants device {target_device} but only {torch.cuda.device_count()} devices available.")
+        return rank, world_size
 
-
-def setup_singlenode(
-    backend: str = str, rank: int = None, world_size: int = None
-) -> None:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "14322"
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-    if backend == "nccl":
-        torch.cuda.set_device(rank)
-
-
-def setup_multinode(backend: str) -> None:
-    rank = int(os.environ["SLURM_PROCID"])
-    local_rank = int(os.environ["SLURM_LOCALID"])
-    world_size = int(os.environ["SLURM_NTASKS"])
-    local_world_size = int(os.environ["SLURM_NTASKS_PER_NODE"])
-    assert os.environ["MASTER_ADDR"]
-    assert os.environ["MASTER_PORT"]
-    timeout = timedelta(seconds=60)
-
-    dist.init_process_group(backend, rank=rank, world_size=world_size, timeout=timeout)
-    if backend == "nccl":
-        torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank, local_world_size
-
-
-def cleanup():
-    dist.destroy_process_group()
-
-
-def ddp_main(
+def ddp_benchmark_worker(
     rank: int,
     world_size: int,
     backend: str,
-    data: torch.Tensor,
-    labels: torch.Tensor,
-    model_args: ModelArgs,
-    optimizer_args: OptimizerArgs,
-    batched: bool = False,
-    shard_optim: bool = False,
-    profile_memory: bool = False,
-    dd_bucket: bool = False,
-    multinode: bool = False,
+    use_cuda_passed: bool,
+    model_config_name: str,
+    multinode: bool,
+    batched_allreduce: bool # Added for flat DDP
 ):
-    if rank == -1:
-        rank, world_size, _, _ = setup_multinode(backend)
-    else:
-        setup_singlenode(backend, rank, world_size)
+    global _global_use_cuda_for_spawn
+    _global_use_cuda_for_spawn = use_cuda_passed
 
-    DEVICE = "cuda" if backend == "nccl" else "cpu"
+    actual_rank, actual_world_size = setup_distributed(rank, world_size, backend, multinode, use_cuda_passed)
+    if multinode and actual_rank is None:
+        return
 
-    if rank == 0:
-        logger.info(
-            f"Running benchmark with model config: {model_args.name}\n{model_args}"
-        )
+    DEVICE = "cuda" if use_cuda_passed and torch.cuda.is_available() else "cpu"
+    if actual_rank == 0: logger.info(f"Using device: {DEVICE}, Rank: {actual_rank}, WorldSize: {actual_world_size}, BatchedAllreduce: {batched_allreduce}")
 
-    torch.manual_seed(rank)
-    partition = data.size(0) // world_size
-    start_index = rank * partition
-    end_index = start_index + partition
-
-    warmup_steps = 5
-    num_steps = 21
-        
-    data = data.to(DEVICE)
-    labels = labels.to(DEVICE)
-
+    cfg_data = MODEL_CONFIGS[model_config_name]
+    # Ensure all required args for your TransformerLM are passed
     model = TransformerLM(
-        vocab_size=model_args.vocab_size,
-        context_length=model_args.context_length,
-        d_model=model_args.d_model,
-        num_layers=model_args.num_layers,
-        num_heads=model_args.num_heads,
-        d_ff=model_args.d_ff,
-        attn_pdrop=model_args.attn_pdrop,
-        residual_pdrop=model_args.residual_pdrop,
-        norm_type="pre" if model_args.use_layer_norm else "none",
+        vocab_size=cfg_data.vocab_size,
+        context_length=cfg_data.context_length,
+        d_model=cfg_data.d_model,
+        num_layers=cfg_data.num_layers,
+        num_heads=cfg_data.num_heads,
+        d_ff=cfg_data.d_ff,
+        attn_pdrop=cfg_data.attn_pdrop,
+        residual_pdrop=cfg_data.residual_pdrop,
+        # Pass norm flags if your TransformerLM expects them
+        use_layer_norm=cfg_data.use_layer_norm,
+        use_triton_rmsnorm=cfg_data.use_triton_rmsnorm
     ).to(DEVICE)
 
-    if shard_optim:
-        optimizer = OptimizerSharded(
-            model.parameters(),
-            AdamW,
-            lr=optimizer_args.lr,
-            betas=optimizer_args.betas,
-            eps=optimizer_args.eps,
-            weight_decay=optimizer_args.weight_decay,
-        )
-    else:
-        optimizer = AdamW(
-            model.parameters(),
-            lr=optimizer_args.lr,
-            betas=optimizer_args.betas,
-            eps=optimizer_args.eps,
-            weight_decay=optimizer_args.weight_decay,
-        )
+    optimizer = AdamW(model.parameters(), **OPTIMIZER_ARGS)
     model.train()
 
-    comm_time = 0
+    # Broadcast initial model parameters from rank 0
+    for param in model.parameters():
+        dist.broadcast(param.data, 0, async_op=False)
+    dist.barrier()
 
-    # Broadcast rank 0 model
-    start = timeit.default_timer()
-    if dd_bucket:
-        model = DDPBucketed(model, bucket_size_mb=64)
-    elif batched:
-        params = torch.nn.utils.parameters_to_vector(model.parameters())
-        dist.broadcast(params, 0, async_op=False)
-        dist.barrier()
-        torch.cuda.synchronize()
-        torch.nn.utils.vector_to_parameters(params, model.parameters())
-    else:
-        for param in model.parameters():
-            dist.broadcast(param.data, 0, async_op=False)
-        dist.barrier()
-    comm_time += timeit.default_timer() - start
+    batch_size_per_gpu = 16 
+    local_batch_size = batch_size_per_gpu
+    inputs = torch.randint(0, cfg_data.vocab_size, (local_batch_size, cfg_data.context_length), device=DEVICE)
+    targets = torch.randint(0, cfg_data.vocab_size, (local_batch_size, cfg_data.context_length), device=DEVICE)
+    
+    num_warmup_steps = 5
+    num_benchmark_steps = 10 # As per assignment PDF example for naive_ddp_benchmarking
 
-    if profile_memory and rank == 0:
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
-
-    step_timer = timeit.default_timer()
-    for step in tqdm(range(num_steps)):
-        if step == warmup_steps - 1:
-            step_timer = timeit.default_timer()
-        out = model(data[start_index:end_index])
-        loss = loss = cross_entropy(out, labels[start_index:end_index])
+    for step in range(num_warmup_steps):
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(inputs)
+        loss = cross_entropy(logits.view(-1, cfg_data.vocab_size), targets.view(-1))
         loss.backward()
-
-        start = timeit.default_timer()
-        if dd_bucket:
-            model.finish_gradient_synchronization()
-        elif batched:
-            params = torch._utils._flatten_dense_tensors(
-                [param.grad for param in model.parameters()]
-            )
-            if backend == "nccl":
-                dist.all_reduce(tensor=params, op=dist.ReduceOp.AVG, async_op=False)
-            else:
-                dist.all_reduce(tensor=params, op=dist.ReduceOp.SUM, async_op=False)
-                params /= world_size
-            dist.barrier()
-            torch.cuda.synchronize()
-            for param, grad in zip(
-                model.parameters(),
-                torch._utils._unflatten_dense_tensors(
-                    params, [p.grad for p in model.parameters()]
-                ),
-            ):
-                param.grad = grad
+        # Naive/Flat DDP gradient sync
+        if batched_allreduce:
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            if grads:
+                flat_grads = torch._utils._flatten_dense_tensors(grads)
+                op = dist.ReduceOp.AVG if backend == "nccl" else dist.ReduceOp.SUM
+                dist.all_reduce(tensor=flat_grads, op=op, async_op=False)
+                if backend == "gloo" and op == dist.ReduceOp.SUM:
+                    flat_grads /= actual_world_size
+                for grad_orig, grad_flat_unflattened in zip(grads, torch._utils._unflatten_dense_tensors(flat_grads, grads)):
+                    grad_orig.copy_(grad_flat_unflattened)
         else:
             for param in model.parameters():
-                if not param.requires_grad:
-                    continue
-                if backend == "nccl":
-                    dist.all_reduce(
-                        tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False
-                    )
-                else:
-                    dist.all_reduce(
-                        tensor=param.grad, op=dist.ReduceOp.SUM, async_op=False
-                    )
-                    param.grad /= world_size
-            dist.barrier()
-        if step >= warmup_steps:
-            comm_time += timeit.default_timer() - start
-
+                if param.grad is not None:
+                    op = dist.ReduceOp.AVG if backend == "nccl" else dist.ReduceOp.SUM
+                    dist.all_reduce(tensor=param.grad, op=op, async_op=False)
+                    if backend == "gloo" and op == dist.ReduceOp.SUM:
+                        param.grad /= actual_world_size
         optimizer.step()
-        optimizer.zero_grad()
 
-        logger.debug(f"Rank {rank}: step = {step}, loss = {loss.item()}")
-
+    if use_cuda_passed: torch.cuda.synchronize()
     dist.barrier()
-    if rank == 0:
-        logger.info(
-            f"Time taken per steps: {(timeit.default_timer() - step_timer) / (num_steps - warmup_steps)}"
-        )
-        logger.info(f"Time taken for communication: {comm_time}")
-        if profile_memory:
-            torch.cuda.memory._dump_snapshot(
-                f"memory_snapshot-{model_args.name}-optim-sharding-{shard_optim}-multinode-{multinode}.pickle"
-            )
-            torch.cuda.memory._record_memory_history(enabled=None)
 
-    validate_ddp_net_equivalence(model, rank)
-    cleanup()
+    total_step_times = []
+    total_comm_times = []
 
+    for step in range(num_benchmark_steps):
+        if use_cuda_passed: torch.cuda.synchronize()
+        dist.barrier()
+        step_start_time = timeit.default_timer()
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(inputs)
+        loss = cross_entropy(logits.view(-1, cfg_data.vocab_size), targets.view(-1))
+        loss.backward()
+        
+        if use_cuda_passed: torch.cuda.synchronize() # Ensure grads are ready
+        comm_start_time = timeit.default_timer()
+        if batched_allreduce:
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            if grads:
+                flat_grads = torch._utils._flatten_dense_tensors(grads)
+                op = dist.ReduceOp.AVG if backend == "nccl" else dist.ReduceOp.SUM
+                dist.all_reduce(tensor=flat_grads, op=op, async_op=False)
+                if backend == "gloo" and op == dist.ReduceOp.SUM:
+                    flat_grads /= actual_world_size
+                # Unflatten (important for optimizer.step())
+                for grad_orig, grad_flat_unflattened in zip(grads, torch._utils._unflatten_dense_tensors(flat_grads, grads)):
+                    grad_orig.copy_(grad_flat_unflattened)
+        else:
+            for param in model.parameters():
+                if param.grad is not None:
+                    op = dist.ReduceOp.AVG if backend == "nccl" else dist.ReduceOp.SUM
+                    dist.all_reduce(tensor=param.grad, op=op, async_op=False)
+                    if backend == "gloo" and op == dist.ReduceOp.SUM:
+                        param.grad /= actual_world_size
+        if use_cuda_passed: torch.cuda.synchronize() # Ensure comm is done
+        comm_time_per_step = timeit.default_timer() - comm_start_time
+        total_comm_times.append(comm_time_per_step)
+        
+        optimizer.step()
+
+        if use_cuda_passed: torch.cuda.synchronize()
+        dist.barrier()
+        step_time = timeit.default_timer() - step_start_time
+        total_step_times.append(step_time)
+
+    if actual_rank == 0:
+        avg_step_time = sum(total_step_times) / len(total_step_times)
+        avg_comm_time = sum(total_comm_times) / len(total_comm_times)
+        logger.info(f"Model: {model_config_name}, Backend: {backend}, CUDA: {use_cuda_passed}, WorldSize: {actual_world_size}, Batched: {batched_allreduce}")
+        logger.info(f"Avg Total Time/Step: {avg_step_time:.4f} s")
+        logger.info(f"Avg Comm Time/Step: {avg_comm_time:.4f} s")
+
+    dist.destroy_process_group()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", type=str, required=True)
+    parser.add_argument("--model-config", type=str, required=True, choices=MODEL_CONFIGS.keys())
+    parser.add_argument("--backend", type=str, required=True, choices=["gloo", "nccl"])
+    parser.add_argument("--world_size", type=int, required=True)
+    parser.add_argument("--use_cuda", action="store_true", default=False)
     parser.add_argument("--multinode", action="store_true", default=False)
-    parser.add_argument("--world_size", type=int, default=1)
-    parser.add_argument("--shard-optim", action="store_true", default=False)
-    parser.add_argument("--profile-memory", action="store_true", default=False)
-    parser.add_argument("--ddp-bucket", action="store_true", default=False)
-    parser.add_argument(
-        "--model-config",
-        type=str,
-        default="small",
-        choices=list(MODEL_CONFIGS.keys()) + ["all"],
-    )
-    parser.add_argument("--batched", action="store_true", default=False)
+    parser.add_argument("--batched", action="store_true", default=False, help="Enable batched (flat) gradient all-reduce")
+    # Add profiling args if/when needed for problem 3.4.2 b/c
+    # parser.add_argument("--enable_profiling", action="store_true", default=False)
+    # parser.add_argument("--profile_output_file", type=str, default="trace.json")
     args = parser.parse_args()
 
-    model_cfg = (
-        MODEL_CONFIGS.keys() if args.model_config == "all" else [args.model_config]
-    )
-
-    for model_config in model_cfg:
-        model_args = MODEL_CONFIGS[model_config]
-        model_args.name = args.model_config
-        optimizer_args = OptimizerArgs()
-        args = parser.parse_args()
-
-        # Generate data
-        batch_size = 16
-        torch.manual_seed(0)
-        data = torch.randint(
-            0,
-            model_args.vocab_size,
-            (batch_size * args.world_size, model_args.context_length),
+    if args.multinode:
+        ddp_benchmark_worker(-1, -1, args.backend, args.use_cuda, args.model_config, True, args.batched)
+    else:
+        assert "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ, \
+            "For single-node mp.spawn, MASTER_ADDR and MASTER_PORT must be set in environment."
+        mp.spawn(
+            ddp_benchmark_worker,
+            args=(args.world_size, args.backend, args.use_cuda, args.model_config, False, args.batched),
+            nprocs=args.world_size,
+            join=True,
         )
-        labels = torch.randint(
-            0,
-            model_args.vocab_size,
-            (batch_size * args.world_size, model_args.context_length),
-        )
-
-        if args.multinode:
-            ddp_main(
-                -1,
-                -1,
-                args.backend,
-                data,
-                labels,
-                model_args,
-                optimizer_args,
-                args.batched,
-                args.shard_optim,
-                args.profile_memory,
-                args.ddp_bucket,
-                args.multinode,
-            )
-        else:
-            mp.spawn(
-                ddp_main,
-                args=(
-                    args.world_size,
-                    args.backend,
-                    data,
-                    labels,
-                    model_args,
-                    optimizer_args,
-                    args.batched,
-                    args.shard_optim,
-                    args.profile_memory,
-                    args.ddp_bucket,
-                    args.multinode,
-                ),
-                nprocs=args.world_size,
-                join=True,
-            )
-
 
 if __name__ == "__main__":
     main()

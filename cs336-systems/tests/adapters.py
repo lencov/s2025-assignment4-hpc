@@ -33,10 +33,8 @@ def get_rmsnorm_autograd_function_triton() -> Type:
     Returns:
         A class object (not an instance of the class)
     """
-    # For example: return MyTritonRMSNormAutogradFunctionClass
-    from cs336_systems.rms import RMSNormTriton
-
-    return RMSNormTriton
+    from cs336_systems.rms import RMSNormTritonFunc
+    return RMSNormTritonFunc
 
 
 def rmsnorm_backward_g_pytorch(
@@ -103,7 +101,7 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDPIndividualParameters(module)
-    from cs336_systems.ddp_overlap import DDP
+    from cs336_systems.ddp import DDP
     return DDP(module)
 
 
@@ -142,9 +140,8 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    from cs336_systems.ddp_bucket import DDPBucketed
-    #return DDPBucketed(module, bucket_size_mb)
-    return DDPBucketed(module, bucket_size_mb)
+    # Skipped section
+    pass
 
 
 def ddp_bucketed_on_after_backward(
@@ -160,8 +157,8 @@ def ddp_bucketed_on_after_backward(
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-    ddp_model.finish_gradient_synchronization()
+    # Skipped section
+    pass
 
 
 def ddp_bucketed_on_train_batch_start(
@@ -197,5 +194,5 @@ def get_sharded_optimizer(
     Returns:
         Instance of sharded optimizer.
     """
-    from cs336_systems.optimizer_sharding import OptimizerSharded
-    return OptimizerSharded(params, optimizer_cls, **kwargs)
+    # Skipped section
+    pass
